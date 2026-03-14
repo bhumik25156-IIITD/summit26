@@ -1,0 +1,113 @@
+import type { ProductAnalysisResponse, ProductNewsResponse } from "./types";
+
+const API_BASE =
+  (import.meta as any).env.VITE_API_BASE_URL ?? "http://localhost:8000";
+
+export interface UserProfilePayload {
+  allergies: string[];
+  diseases: string[];
+}
+
+export async function analyzeProduct(
+  barcode: string,
+  profile: UserProfilePayload
+): Promise<ProductAnalysisResponse> {
+  const res = await fetch(`${API_BASE}/analyze`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      barcode,
+      user_profile: profile,
+    }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    try {
+      const parsed = JSON.parse(text);
+      // Ensure we extract the specific detail property sent by FastAPI
+      throw new Error(parsed.detail || `Analyze request failed with ${res.status}`);
+    } catch (e: any) {
+      if (e.message) throw e;
+      throw new Error(text || `Analyze request failed with ${res.status}`);
+    }
+  }
+
+  return (await res.json()) as ProductAnalysisResponse;
+}
+
+export async function analyzeImage(
+  file: File,
+  profile: UserProfilePayload
+): Promise<ProductAnalysisResponse> {
+  const formData = new FormData();
+  formData.append("label_image", file);
+  profile.allergies.forEach((a) => formData.append("allergies", a));
+  profile.diseases.forEach((d) => formData.append("diseases", d));
+
+  const res = await fetch(`${API_BASE}/analyze-label`, {
+    method: "POST",
+    body: formData,
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    try {
+      const parsed = JSON.parse(text);
+      throw new Error(parsed.detail || `Analyze image request failed with ${res.status}`);
+    } catch (e: any) {
+      if (e.message) throw e;
+      throw new Error(text || `Analyze image request failed with ${res.status}`);
+    }
+  }
+
+  return (await res.json()) as ProductAnalysisResponse;
+}
+
+export async function extractBarcode(file: File): Promise<string> {
+  const formData = new FormData();
+  formData.append("image", file);
+
+  const res = await fetch(`${API_BASE}/extract-barcode`, {
+    method: "POST",
+    body: formData,
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    try {
+      const parsed = JSON.parse(text);
+      throw new Error(parsed.detail || `Extract barcode request failed with ${res.status}`);
+    } catch (e: any) {
+      if (e.message) throw e;
+      throw new Error(text || `Extract barcode request failed with ${res.status}`);
+    }
+  }
+
+  const data = await res.json();
+  return data.barcode;
+}
+
+export async function fetchProductNews(query: string): Promise<ProductNewsResponse> {
+  const url = new URL(`${API_BASE}/product-news`);
+  url.searchParams.append("query", query);
+
+  const res = await fetch(url.toString(), {
+    method: "GET",
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    try {
+      const parsed = JSON.parse(text);
+      throw new Error(parsed.detail || `Fetch news request failed with ${res.status}`);
+    } catch (e: any) {
+      if (e.message) throw e;
+      throw new Error(text || `Fetch news request failed with ${res.status}`);
+    }
+  }
+
+  return (await res.json()) as ProductNewsResponse;
+}

@@ -1,0 +1,613 @@
+import os
+import io
+import json
+import asyncio
+from enum import Enum
+from typing import List, Optional, Dict, Any
+
+import httpx
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+import google.genai as genai
+
+# Make sure these exist in your prompts.py file
+from prompts import get_master_system_prompt, build_off_user_instruction
+
+# --- INITIALIZATION ---
+load_dotenv(override=True)
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY is not set. Please configure it in your .env file.")
+
+NEWS_API_KEY = os.getenv("NEWS_API_KEY")
+if not NEWS_API_KEY:
+    print("WARNING: NEWS_API_KEY is not set. News features will not work.")
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+# --- RETRY HELPER ---
+import re
+
+async def gemini_generate_with_retry(model, content, max_retries=3, system_instruction=None):
+    """Retry Gemini API calls with smart backoff based on server-reported retry delays."""
+    last_error = None
+    
+    def generate_content_sync():
+        """Synchronous wrapper for Gemini API call"""
+        # Convert image dicts to proper genai.types.Part objects
+        if isinstance(content, list):
+            converted_content = []
+            for item in content:
+                if isinstance(item, dict) and 'mime_type' in item and 'data' in item:
+                    # Convert to Part with inline_data
+                    try:
+                        blob = genai.types.Blob(
+                            mime_type=item['mime_type'],
+                            data=item['data']
+                        )
+                        part = genai.types.Part(inline_data=blob)
+                        converted_content.append(part)
+                    except Exception as e:
+                        print(f"Warning: Failed to create image Part: {e}")
+                        # Skip image on error
+                else:
+                    converted_content.append(item)
+            full_content = converted_content
+        else:
+            full_content = content
+            
+        # Prepend system instruction to text if provided
+        if system_instruction and full_content:
+            if isinstance(full_content, str):
+                full_content = f"[SYSTEM: {system_instruction}]\n\n{full_content}"
+            elif isinstance(full_content, list) and len(full_content) > 0 and isinstance(full_content[0], str):
+                full_content[0] = f"[SYSTEM: {system_instruction}]\n\n{full_content[0]}"
+        
+        return client.models.generate_content(
+            model=model,
+            contents=full_content
+        )
+    
+    for attempt in range(max_retries):
+        try:
+            # Run synchronous API in thread pool for async compatibility
+            return await asyncio.to_thread(generate_content_sync)
+        except Exception as e:
+            last_error = e
+            err_str = str(e)
+            err_lower = err_str.lower()
+            is_rate_limit = "429" in err_lower or "quota" in err_lower or "exhausted" in err_lower or "resource" in err_lower
+            
+            if not is_rate_limit:
+                raise  # Non-rate-limit errors fail immediately
+            
+            if attempt < max_retries - 1:
+                # Try to extract retry_delay from error message
+                match = re.search(r'retry.*?(\d+)', err_str)
+                wait_time = int(match.group(1)) + 2 if match else 20 * (attempt + 1)
+                wait_time = min(wait_time, 65)  # Cap at 65 seconds
+                print(f"Rate limited (attempt {attempt + 1}/{max_retries}). Waiting {wait_time}s before retry...")
+                await asyncio.sleep(wait_time)
+            else:
+                print(f"All {max_retries} attempts exhausted. Rate limit still active.")
+                raise
+
+app = FastAPI(title="WiseBite Backend", version="0.1.0")
+
+# --- CORS CONFIGURATION ---
+origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# --- PYDANTIC MODELS ---
+class HazardLevel(str, Enum):
+    SAFE = "safe"
+    CAUTION = "caution"
+    HAZARD = "hazard"
+
+class UserProfile(BaseModel):
+    allergies: List[str] = Field(
+        default_factory=list,
+        description="Known allergies (e.g., 'peanuts', 'gluten').",
+    )
+    diseases: List[str] = Field(
+        default_factory=list,
+        description="Known diseases or conditions (e.g., 'diabetes', 'celiac disease').",
+    )
+
+class ProductRequest(BaseModel):
+    barcode: str = Field(..., description="Product barcode to look up in Open Food Facts.")
+    user_profile: UserProfile
+
+class IngredientRisk(BaseModel):
+    ingredient: str
+    hazard_level: HazardLevel
+    explanation: str
+    related_allergies: List[str] = Field(default_factory=list)
+    related_diseases: List[str] = Field(default_factory=list)
+
+class ProductAnalysisResponse(BaseModel):
+    product_name: Optional[str] = "Unknown Image Product"
+    barcode: Optional[str] = "UNKNOWN"
+    category: str = Field(
+        default="misc", 
+        description="Classify into EXACTLY one: energy_drinks, soft_drinks, water_drinks, juice_drinks, tea_coffee, milk_dairy, cheese_dairy, plant_milk, bakery_bread, bakery_pastry, cereal_grains, snacks_salty, snacks_sweet, nuts_seeds, fruits_fresh, veggies_fresh, canned_goods, frozen_meals, condiments, spices_baking, meat_poultry, seafood, plant_protein, misc. Default to misc if unknown."
+    )
+    ingredients: List[str] = Field(default_factory=list)
+    ingredient_risks: List[IngredientRisk] = Field(default_factory=list)
+    summary: str
+    warnings: List[str] = Field(default_factory=list)
+    raw_openfoodfacts: Dict[str, Any] = Field(default_factory=dict)
+
+class NewsArticle(BaseModel):
+    title: str
+    description: Optional[str] = None
+    url: str
+    source: str
+    publishedAt: str
+
+class ProductNewsResponse(BaseModel):
+    articles: List[NewsArticle] = Field(default_factory=list)
+
+
+# --- HELPER FUNCTIONS ---
+OPENFOODFACTS_PRODUCT_URL = "https://world.openfoodfacts.org/api/v2/product/{barcode}.json"
+
+async def fetch_open_food_facts_product(barcode: str) -> Dict[str, Any]:
+    url = OPENFOODFACTS_PRODUCT_URL.format(barcode=barcode)
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(url)
+    except httpx.ReadTimeout:
+        raise HTTPException(
+            status_code=504,
+            detail="Timed out while contacting Open Food Facts. Please try again or check your internet connection.",
+        )
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Error contacting Open Food Facts: {exc}",
+        )
+
+    if resp.status_code == 404:
+        raise HTTPException(status_code=404, detail="Product not found in Open Food Facts.")
+    try:
+        data = resp.json()
+    except ValueError:
+        raise HTTPException(status_code=502, detail="Invalid response from Open Food Facts.")
+
+    if data.get("status") != 1:
+        raise HTTPException(status_code=404, detail="Product not found in Open Food Facts.")
+
+    return data
+
+async def analyze_with_gemini(
+    product_data: Dict[str, Any],
+    user_profile: UserProfile,
+    barcode: str,
+) -> ProductAnalysisResponse:
+    # 1. Extract raw data safely
+    product = product_data.get("product", {}) or {}
+    product_name = product.get("product_name") or product.get("product_name_en") or "Unknown Product"
+
+    ingredients_texts = []
+    for ing in product.get("ingredients", []):
+        if isinstance(ing, dict) and "text" in ing:
+            ingredients_texts.append(str(ing["text"]))
+        elif isinstance(ing, str):
+            ingredients_texts.append(ing)
+
+    # 2. Use the client to generate content
+    system_instruction = get_master_system_prompt()
+
+    # 3. Build User Instruction
+    schema = {
+        "type": "object",
+        "properties": {
+            "product_name": {"type": "string"},
+            "barcode": {"type": "string"},
+            "category": {"type": "string"},
+            "ingredients": {"type": "array", "items": {"type": "string"}},
+            "ingredient_risks": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "ingredient": {"type": "string"},
+                        "hazard_level": {"type": "string", "enum": ["safe", "caution", "hazard"]},
+                        "explanation": {"type": "string"},
+                        "related_allergies": {"type": "array", "items": {"type": "string"}},
+                        "related_diseases": {"type": "array", "items": {"type": "string"}}
+                    },
+                    "required": ["ingredient", "hazard_level", "explanation", "related_allergies", "related_diseases"]
+                }
+            },
+            "summary": {"type": "string"},
+            "warnings": {"type": "array", "items": {"type": "string"}}
+        },
+        "required": ["product_name", "barcode", "category", "ingredients", "ingredient_risks", "summary", "warnings"]
+    }
+
+    user_instruction = build_off_user_instruction(
+        user_profile=user_profile,
+        barcode=barcode,
+        product_name=product_name,
+        ingredients_texts=ingredients_texts,
+        product_subset={"product_name": product_name},
+        schema_description=schema
+    )
+
+    # 4. Generate and Parse
+    try:
+        response = await gemini_generate_with_retry(
+            model="gemini-2.5-flash",
+            content=user_instruction["parts"],
+            system_instruction=system_instruction
+        )
+        
+        # Get the text from the response - handle different response formats
+        if hasattr(response, 'text'):
+            text = response.text.strip()
+        elif hasattr(response, 'candidates') and response.candidates:
+            text = response.candidates[0].content.parts[0].text.strip()
+        else:
+            raise HTTPException(status_code=500, detail="Unexpected response format from Gemini API")
+        
+        # Strip markdown fences
+        if "```" in text:
+            text = text.split("```")[1]
+            if text.startswith("json"): text = text[4:]
+        text = text.strip("`").strip()
+
+        parsed = json.loads(text)
+        
+        # Inject metadata to ensure Pydantic doesn't fail
+        parsed.update({
+            "barcode": barcode,
+            "product_name": product_name,
+            "ingredients": ingredients_texts,
+            "raw_openfoodfacts": {"code": barcode, "product_name": product_name}
+        })
+
+        return ProductAnalysisResponse(**parsed)
+
+    except json.JSONDecodeError as json_err:
+        print(f"JSON parsing error in analyze_with_gemini: {json_err}")
+        print(f"Text that failed to parse: {text}")
+        raise HTTPException(status_code=500, detail=f"Failed to parse Gemini response as JSON: {str(json_err)}")
+    except Exception as e:
+        print(f"ERROR in analyze_with_gemini: {type(e).__name__}: {e}")
+        err_str = str(e).lower()
+        if "429" in err_str or "quota" in err_str or "exhausted" in err_str or "resource_exhausted" in err_str:
+            raise HTTPException(status_code=429, detail="Gemini API rate limit exceeded. Please wait 1 minute and try again.")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- API ENDPOINTS ---
+
+@app.post("/analyze-label", response_model=ProductAnalysisResponse)
+async def analyze_label_image(
+    allergies: str = Form(default=""),
+    diseases: str = Form(default=""),
+    label_image: UploadFile = File(...)
+):
+    """
+    Reads an image of an ingredient label, extracts the text, 
+    and analyzes it against the user's profile using Gemini 2.5 Flash.
+    """
+    user_profile = UserProfile(
+        allergies=[a.strip() for a in allergies.split(",") if a.strip()],
+        diseases=[d.strip() for d in diseases.split(",") if d.strip()]
+    )
+
+    image_bytes = await label_image.read()
+    
+    image_part = {
+        "mime_type": label_image.content_type or "image/jpeg",
+        "data": image_bytes
+    }
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "product_name": {"type": "string"},
+            "barcode": {"type": "string"},
+            "category": {"type": "string"},
+            "ingredients": {"type": "array", "items": {"type": "string"}},
+            "ingredient_risks": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "ingredient": {"type": "string"},
+                        "hazard_level": {"type": "string", "enum": ["safe", "caution", "hazard"]},
+                        "explanation": {"type": "string"},
+                        "related_allergies": {"type": "array", "items": {"type": "string"}},
+                        "related_diseases": {"type": "array", "items": {"type": "string"}}
+                    },
+                    "required": ["ingredient", "hazard_level", "explanation", "related_allergies", "related_diseases"]
+                }
+            },
+            "summary": {"type": "string"},
+            "warnings": {"type": "array", "items": {"type": "string"}}
+        },
+        "required": ["product_name", "category", "ingredients", "ingredient_risks", "summary", "warnings"]
+    }
+
+    profile_context = ""
+    if user_profile.allergies:
+        profile_context += f"\n- ALLERGIES: {user_profile.allergies}. Any ingredient containing or derived from these allergens MUST be 'hazard'."
+    if user_profile.diseases:
+        profile_context += f"\n- DISEASES/CONDITIONS: {user_profile.diseases}. Ingredients harmful for these conditions MUST be 'hazard' or 'caution'. Example: sugar/glucose/fructose/sucrose = 'hazard' for diabetes; sodium/salt = 'caution' for hypertension."
+
+    prompt_text = (
+        f"CRITICAL: Read the ingredients label from the attached image. "
+        f"Extract ALL ingredients and personalize the hazard_level for THIS specific user's medical profile. "
+        f"Do NOT give generic safety ratings — an ingredient safe for healthy people may be HAZARDOUS for this user.\n"
+        f"\nUSER MEDICAL PROFILE:{profile_context}\n"
+        f"\nFor EVERY ingredient: set hazard_level based on THIS user's allergies and diseases. "
+        f"Always populate related_allergies and related_diseases with the user's matching conditions. "
+        f"Return ONLY valid JSON matching this schema: {json.dumps(schema)}"
+    )
+
+    try:
+        response = await gemini_generate_with_retry(
+            model="gemini-2.5-flash",
+            content=[prompt_text, image_part],
+            system_instruction=get_master_system_prompt()
+        )
+        
+        # Debug: Print response type and attributes
+        print(f"Response type: {type(response)}")
+        print(f"Response attributes: {dir(response)}")
+        
+        # Get the text from the response - handle different response formats
+        if hasattr(response, 'text'):
+            text = response.text.strip()
+        elif hasattr(response, 'candidates') and response.candidates:
+            text = response.candidates[0].content.parts[0].text.strip()
+        else:
+            raise HTTPException(status_code=500, detail="Unexpected response format from Gemini API")
+        
+        print(f"Raw response text: {text[:200]}...")  # Debug first 200 chars
+        
+        if "```" in text:
+            text = text.split("```")[1]
+            if text.startswith("json"): text = text[4:]
+        text = text.strip("`").strip()
+
+        print(f"Cleaned text: {text[:200]}...")  # Debug cleaned text
+        
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as json_err:
+            print(f"JSON parsing error: {json_err}")
+            print(f"Text that failed to parse: {text}")
+            raise HTTPException(status_code=500, detail=f"Failed to parse Gemini response as JSON: {str(json_err)}")
+        
+        parsed["barcode"] = "IMAGE_SCAN"
+        parsed["raw_openfoodfacts"] = {"source": "uploaded_image"}
+        if "product_name" not in parsed or not parsed["product_name"]:
+            parsed["product_name"] = "Image Scan Product"
+
+        return ProductAnalysisResponse(**parsed)
+
+    except json.JSONDecodeError:
+        # Already handled above
+        raise
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        print(f"ERROR in analyze_label_image: {type(e).__name__}: {e}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
+        
+        err_str = str(e).lower()
+        if "429" in err_str or "quota" in err_str or "exhausted" in err_str or "resource_exhausted" in err_str:
+             raise HTTPException(status_code=429, detail="Gemini API rate limit exceeded. Please wait and try again.")
+        elif "invalid" in err_str and "image" in err_str:
+            raise HTTPException(status_code=400, detail="Invalid image format. Please upload a clear image of an ingredient label.")
+        elif "timeout" in err_str or "readtimeout" in err_str:
+            raise HTTPException(status_code=504, detail="Request timed out. Please try again.")
+        else:
+            raise HTTPException(status_code=500, detail=f"Failed to process image label: {str(e)}")
+
+class BarcodeExtractionResponse(BaseModel):
+    barcode: str
+
+@app.post("/extract-barcode", response_model=BarcodeExtractionResponse)
+async def extract_barcode_from_image(
+    image: UploadFile = File(...)
+):
+    """
+    Reads an image of a barcode, extracts the numeric value,
+    and returns it using Gemini 2.5 Flash.
+    """
+    image_bytes = await image.read()
+    
+    image_part = {
+        "mime_type": image.content_type or "image/jpeg",
+        "data": image_bytes
+    }
+
+    prompt_text = (
+        "Analyze this image and extract the numerical barcode value. "
+        "Return ONLY the numbers of the barcode. "
+        "Do not return any surrounding text, markdown formatting, spaces, or words. "
+        "If no clear barcode can be found in the image, return exactly: NOT_FOUND"
+    )
+
+    try:
+        response = await gemini_generate_with_retry(
+            model="gemini-2.5-flash",
+            content=[prompt_text, image_part]
+        )
+        
+        # Get the text from the response - handle different response formats
+        if hasattr(response, 'text'):
+            text = response.text.strip()
+        elif hasattr(response, 'candidates') and response.candidates:
+            text = response.candidates[0].content.parts[0].text.strip()
+        else:
+            raise HTTPException(status_code=500, detail="Unexpected response format from Gemini API")
+        
+        if not text or "NOT_FOUND" in text:
+            raise HTTPException(status_code=400, detail="Could not detect a barcode in the image.")
+        
+        # Strip any formatting just in case
+        if "```" in text:
+            text = text.split("```")[1]
+            if text.startswith("json"): text = text[4:]
+        text = text.strip("`").strip()
+
+        # Isolate just the numbers
+        import re
+        numbers = re.sub(r'[^0-9]', '', text)
+        
+        if not numbers:
+            raise HTTPException(status_code=400, detail="Could not detect a numeric barcode in the image.")
+
+        return BarcodeExtractionResponse(barcode=numbers)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"ERROR in extract_barcode_from_image: {type(e).__name__}: {e}")
+        err_str = str(e).lower()
+        if "429" in err_str or "quota" in err_str or "exhausted" in err_str or "resource_exhausted" in err_str:
+            raise HTTPException(status_code=429, detail="Gemini API rate limit exceeded. Please wait and try again.")
+        elif "invalid" in err_str and "image" in err_str:
+            raise HTTPException(status_code=400, detail="Invalid image format. Please upload a clear image of a barcode.")
+        else:
+            raise HTTPException(status_code=500, detail=f"Failed to process barcode image: {str(e)}")
+
+@app.post("/analyze", response_model=ProductAnalysisResponse)
+async def analyze_product(request: ProductRequest) -> ProductAnalysisResponse:
+    """
+    Analyze a product's safety for a given user profile.
+    """
+    product_data = await fetch_open_food_facts_product(request.barcode)
+    analysis = await analyze_with_gemini(
+        product_data=product_data,
+        user_profile=request.user_profile,
+        barcode=request.barcode,
+    )
+    return analysis
+
+@app.get("/product-news", response_model=ProductNewsResponse)
+async def get_product_news(query: str):
+    """
+    Fetch real-time updates and controversies about a product using NewsAPI.
+    """
+    if not NEWS_API_KEY:
+        return ProductNewsResponse(**{"articles": []})
+
+    # Build a search query focused on controversies, recalls, or general updates
+    search_query = f'"{query}" AND (controversy OR recall OR update OR safety OR health OR risk)'
+    url = "https://newsapi.org/v2/everything"
+    
+    params = {
+        "q": search_query,
+        "language": "en",
+        "sortBy": "relevancy",
+        "pageSize": 5,
+        "apiKey": NEWS_API_KEY
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, params=params)
+        
+        if resp.status_code != 200:
+            print(f"News API Error: {resp.status_code} - {resp.text}")
+            
+        data = resp.json() if resp.status_code == 200 else {}
+        articles = []
+
+        
+        for item in data.get("articles", []):
+            # Skip articles that are removed or missing essential data
+            if item.get("title") == "[Removed]" or not item.get("title") or not item.get("url"):
+                continue
+                
+            articles.append(NewsArticle(**{
+                "title": item.get("title", "No Title"),
+                "description": item.get("description"),
+                "url": item.get("url", ""),
+                "source": item.get("source", {}).get("name", "Unknown Source"),
+                "publishedAt": item.get("publishedAt", "")
+            }))
+            
+        # Fallback to Gemini for historical controversies
+        if len(articles) < 2:
+            try:
+                prompt = (
+                    f"Are there any major historical controversies, FDA recalls, lawsuits, or health risks "
+                    f"associated with the product or brand '{query}'? For example, the Maggi lead case or MDH masala issues. "
+                    f"If yes, provide 1 or 2 short bullet points summarizing the biggest historical issue. "
+                    f"Format the response strictly as a JSON list of objects, each with 'title', 'description', 'source' (e.g., 'Historical Record'), 'url' (use '#'), and 'publishedAt' (approximate year or 'Historical'). "
+                    f"If there are no known controversies, return an empty array []."
+                )
+                gemini_resp = await gemini_generate_with_retry(
+                    model="gemini-2.5-flash",
+                    content=prompt
+                )
+                
+                # Get the text from the response - handle different response formats
+                if hasattr(gemini_resp, 'text'):
+                    text = gemini_resp.text.strip()
+                elif hasattr(gemini_resp, 'candidates') and gemini_resp.candidates:
+                    text = gemini_resp.candidates[0].content.parts[0].text.strip()
+                else:
+                    print("Unexpected Gemini response format in news fallback")
+                    text = "[]"
+                
+                if "```" in text:
+                    text = text.split("```")[1]
+                    if text.startswith("json"): text = text[4:]
+                text = text.strip("`").strip()
+                
+                try:
+                    import json
+                    historical_data = json.loads(text)
+                    for item in historical_data:
+                        articles.append(NewsArticle(**{
+                            "title": item.get("title", "Historical Controversy"),
+                            "description": item.get("description", ""),
+                            "url": item.get("url", "#"),
+                            "source": item.get("source", "Historical Record"),
+                            "publishedAt": str(item.get("publishedAt", "Historical"))
+                         }))
+                except json.JSONDecodeError as json_err:
+                    print(f"Failed to parse historical news data: {json_err}")
+                    # Continue without historical data
+            except Exception as gemini_err:
+                print(f"Gemini fallback error for news: {gemini_err}")
+
+        return ProductNewsResponse(**{"articles": articles})
+        
+    except Exception as e:
+        print(f"Error fetching product news: {e}")
+        return ProductNewsResponse(**{"articles": []})
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
